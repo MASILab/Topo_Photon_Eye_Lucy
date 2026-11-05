@@ -4,7 +4,7 @@ from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLo
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
 
-# 加入了debug-printing的语句
+# DC_and_CE_loss (debug printing added)
 class DC_and_CE_loss(nn.Module):
     def __init__(self, soft_dice_kwargs, ce_kwargs, weight_ce=1, weight_dice=1, ignore_label=None,
                  dice_class=SoftDiceLoss):
@@ -63,14 +63,9 @@ class DC_and_CE_loss(nn.Module):
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
 
-# TODO: 加入新的Anatomical Prior loss 
-# [一共]
 
-# TODO：加入新的volume-based MSE loss 
 
-# TODO: 加入新的针对指标B1/BM1 loss 
 
-# TODO: 加入weak regularizaiton: symmetrical prior
 
 class DC_and_BCE_loss(nn.Module):
     def __init__(self, bce_kwargs, soft_dice_kwargs, weight_ce=1, weight_dice=1, use_ignore_label: bool = False,

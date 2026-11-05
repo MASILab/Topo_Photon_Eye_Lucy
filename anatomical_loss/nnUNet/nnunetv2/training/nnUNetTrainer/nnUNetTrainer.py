@@ -59,7 +59,7 @@ from nnunetv2.training.dataloading.nnunet_dataset import infer_dataset_class
 from nnunetv2.training.dataloading.data_loader import nnUNetDataLoader
 from nnunetv2.training.logging.nnunet_logger import MetaLogger
 from nnunetv2.training.loss.compound_losses import DC_and_CE_loss, DC_and_BCE_loss
-# # 新添加的 anatomical prior loss
+# Anatomical topology prior loss
 from nnunetv2.training.loss.anatomical_prior import AnatomicalPriorLoss
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
 from nnunetv2.training.loss.dice import get_tp_fp_fn_tn, MemoryEfficientSoftDiceLoss
@@ -161,13 +161,13 @@ class nnUNetTrainer(object):
         self.probabilistic_oversampling = False
         self.num_iterations_per_epoch = 250
         self.num_val_iterations_per_epoch = 50
-        self.num_epochs = 1000
+        self.num_epochs = 350  # nnU-Net default is 1000
         self.current_epoch = 0
         self.enable_deep_supervision = True
 
         ### Dealing with labels/regions
         self.label_manager = self.plans_manager.get_label_manager(dataset_json)
-        # 目前的nnUnet.dataset.json确实是针对regular training --> DC_and_CE_loss
+        # Regular (non-region) training uses DC_and_CE_loss
         # labels can either be a list of int (regular training) or a list of tuples of int (region-based training)
         # needed for predictions. We do sigmoid in case of (overlapping) regions
 
@@ -176,10 +176,12 @@ class nnUNetTrainer(object):
         self.optimizer = self.lr_scheduler = None  # -> self.initialize
         self.grad_scaler = (GradScaler("cuda") if not TORCH_HAS_OLD_GRADSCALER else GradScaler()) if self.device.type == 'cuda' else None
         self.loss = None  # -> self.initialize
-        # 新加入的 anatomical loss
+        # Anatomical topology loss (set up in initialize())
         self.anatomical_loss = None
         self.lambda_anatomical = 0
         self.use_anatomical_loss = True
+        # Number of initial epochs trained with the segmentation loss only
+        self.topo_warmup_epochs = 0
 
 
         ### Simple logging. Don't take that away from me!
@@ -246,15 +248,20 @@ class nnUNetTrainer(object):
                 self.network = DDP(self.network, device_ids=[self.local_rank])
             
             self.loss = self._build_loss()
-            # TODO: 加入anatomical-prior loss (只在最后的resolution)
+            # Anatomical topology loss (applied to the highest-resolution output only)
             self.anatomical_loss = AnatomicalPriorLoss(
                 config_path=os.environ.get("NNUNET_ANATOMICAL_CONFIG", None),
                 reduction='mean'
             )
 
-            # 是否启用和权重，也从 anatomical_prior.py 的 cfg 里读
+            # Enable flag and weight are read from the anatomical loss config
             self.use_anatomical_loss = bool(self.anatomical_loss.cfg.get("enabled", True))
             self.lambda_anatomical = float(self.anatomical_loss.cfg.get("weight", 1.0)) if self.use_anatomical_loss else 0.0
+            self.topo_warmup_epochs = int(self.anatomical_loss.cfg.get("topo_warmup_epochs", 0))
+            self.print_to_log_file(
+                f"[TOPO] enabled={self.use_anatomical_loss}, weight={self.lambda_anatomical}, "
+                f"warmup_epochs={self.topo_warmup_epochs}"
+            )
 
             if not self.use_anatomical_loss:
                 self.anatomical_loss = None
@@ -440,8 +447,8 @@ class nnUNetTrainer(object):
             self.oversample_foreground_percent = oversample_percent
     
 
-    # 加入了几处新的debug print语句 --》 用来查找2D-nnunet调用的几处真正的loss源码
-    # 目前已经在这里loss= DeepSupervision (DC_and_CE_loss)
+    # Debug prints added to confirm which loss is used
+    # loss = DeepSupervisionWrapper(DC_and_CE_loss)
     def _build_loss(self):
         print(f"[LOSS-DEBUG] label_manager.has_regions = {self.label_manager.has_regions}", flush=True)
         if self.label_manager.has_regions:
@@ -464,7 +471,7 @@ class nnUNetTrainer(object):
         # we give each output a weight which decreases exponentially (division by 2) as the resolution decreases
         # this gives higher resolution outputs more weight in the loss
         
-        # print 打印出来具体几层的deep_supervision
+        # Print the deep supervision scales
         if self.enable_deep_supervision:
             deep_supervision_scales = self._get_deep_supervision_scales()
             print(f"[LOSS-DEBUG] deep_supervision_scales = {deep_supervision_scales}", flush=True)
@@ -488,7 +495,15 @@ class nnUNetTrainer(object):
         return loss
 
 
-    # 新加入的函数 return 目前的anatomical loss
+    def _get_effective_lambda_anatomical(self) -> float:
+        """Topology loss weight for the current epoch: 0 during warm-up, the configured weight afterwards."""
+        if (self.anatomical_loss is None) or (not self.use_anatomical_loss):
+            return 0.0
+        if self.current_epoch < self.topo_warmup_epochs:
+            return 0.0
+        return self.lambda_anatomical
+
+    # Compute the anatomical topology loss on the highest-resolution output
     def _compute_anatomical_loss(self, output, target, case_ids):
         if (self.anatomical_loss is None) or (not self.use_anatomical_loss) or (self.lambda_anatomical == 0):
             ref = output[0] if isinstance(output, (list, tuple)) else output
@@ -1051,12 +1066,12 @@ class nnUNetTrainer(object):
 
 
 
-    # train-step的反向传播+计算函数
+    # Training step: forward pass, loss computation and backpropagation
     def train_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
         # batch['keys'] = 1008_train_img1008_orbital_mri__00004 
-        # (和reference_anatomical_prior的case_id是对齐的)
+        # case identifiers of the batch
 
         data = data.to(self.device, non_blocking=True)
         if isinstance(target, list):
@@ -1074,14 +1089,18 @@ class nnUNetTrainer(object):
             # del data
             case_ids = batch['keys']
             l = self.loss(output, target)
-            # 新加入的anatomical loss的计算
+            # Segmentation loss
             base_loss = l
             
-            # 新的 barcode topology loss，只作用于最高分辨率
-            anatomical_loss = self._compute_anatomical_loss(output, target, case_ids)
-            anatomical_loss_weighted = self.lambda_anatomical * anatomical_loss
+            # Persistent-homology topology loss (highest resolution only), active after warm-up
+            effective_lambda = self._get_effective_lambda_anatomical()
+            if effective_lambda > 0:
+                anatomical_loss = self._compute_anatomical_loss(output, target, case_ids)
+            else:
+                anatomical_loss = base_loss.new_zeros(())
+            anatomical_loss_weighted = effective_lambda * anatomical_loss
 
-            # 总 loss
+            # Total loss
             l = base_loss + anatomical_loss_weighted
 
         if self.grad_scaler is not None:
@@ -1095,7 +1114,7 @@ class nnUNetTrainer(object):
             torch.nn.utils.clip_grad_norm_(self.network.parameters(), 12)
             self.optimizer.step()
         
-        # 先总的返回总的loss
+        # Return total loss and its components for logging
         return {
             'loss': float(l.detach().cpu()),
             'base_loss': float(base_loss.detach().cpu()),
@@ -1111,7 +1130,7 @@ class nnUNetTrainer(object):
             dist.all_gather_object(losses_tr, outputs['loss'])
             loss_here = np.vstack(losses_tr).mean()
 
-            # 新加入的 anatomical loss log 
+            # Gather anatomical loss for logging
             anatomical_tr = [None for _ in range(dist.get_world_size())]
             dist.all_gather_object(anatomical_tr, outputs['anatomical_loss'])
             anatomical_here = np.vstack(anatomical_tr).mean()
@@ -1131,7 +1150,7 @@ class nnUNetTrainer(object):
     def on_validation_epoch_start(self):
         self.network.eval()
     
-    # 计算validation_step的函数
+    # Validation step
     def validation_step(self, batch: dict) -> dict:
         data = batch['data']
         target = batch['target']
@@ -1153,10 +1172,14 @@ class nnUNetTrainer(object):
             case_ids = batch['keys']
 
             l = self.loss(output, target)
-            # 新加入的anatomical validation loss 
-            base_loss=l
-            anatomical_loss = self._compute_anatomical_loss(output, target, case_ids)
-            anatomical_loss_weighted = self.lambda_anatomical * anatomical_loss
+            # Anatomical topology loss on validation batch
+            base_loss = l
+            effective_lambda = self._get_effective_lambda_anatomical()
+            if effective_lambda > 0:
+                anatomical_loss = self._compute_anatomical_loss(output, target, case_ids)
+            else:
+                anatomical_loss = base_loss.new_zeros(())
+            anatomical_loss_weighted = effective_lambda * anatomical_loss
             l = base_loss + anatomical_loss_weighted
 
         # we only need the output with the highest output resolution (if DS enabled)
@@ -1257,7 +1280,7 @@ class nnUNetTrainer(object):
         self.logger.log('mean_fg_dice', mean_fg_dice, self.current_epoch)
         self.logger.log('dice_per_class_or_region', global_dc_per_class, self.current_epoch)
         self.logger.log('val_losses', loss_here, self.current_epoch)
-        # 加入新的 loss 画图 
+        # Log anatomical losses for plotting
         self.logger.log('val_anatomical_losses', anatomical_here, self.current_epoch)
         self.logger.log('val_anatomical_losses_weighted', anatomical_weighted_here, self.current_epoch)
 
@@ -1269,7 +1292,7 @@ class nnUNetTrainer(object):
 
         self.print_to_log_file('train_loss', np.round(self.logger.get_value('train_losses', step=-1), decimals=4))
         self.print_to_log_file('val_loss', np.round(self.logger.get_value('val_losses', step=-1), decimals=4))
-        # 新添加的 anatomical loss 
+        # Anatomical loss logging
         self.print_to_log_file('train_anatomical_loss',
                            np.round(self.logger.get_value('train_anatomical_losses', step=-1), decimals=4))
         self.print_to_log_file('val_anatomical_loss',

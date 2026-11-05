@@ -1,0 +1,7 @@
+{
+  "enabled": true,
+  "topo_warmup_epochs": 40,
+  "construction": "0",
+  "use_softmax": true,
+  "exclude_priors": []
+}

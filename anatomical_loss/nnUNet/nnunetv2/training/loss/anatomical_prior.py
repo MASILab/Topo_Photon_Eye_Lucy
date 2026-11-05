@@ -1,15 +1,11 @@
+import json
+import os
 
 import numpy as np
 import torch
 from torch import nn
 import cripser as crip
 import tcripser as trip
-import json
-import os
-import pandas as pd
-import torch
-import numpy as np
-from torch import nn
 
 
 def crip_wrapper(X, D):
@@ -77,11 +73,10 @@ class AnatomicalPriorLoss(nn.Module):
         self.cfg = {
             "enabled": True,
             "weight": 1.0,
-            "reference_csv": None,
             "roi_thresh": roi_thresh,
             "construction": construction,
             "use_softmax": use_softmax,
-            "exclude_priors": ["LR_single"],
+            "exclude_priors": [],
         }
 
         if config_path is None:
@@ -99,10 +94,6 @@ class AnatomicalPriorLoss(nn.Module):
 
         self.prior_specs = self._build_prior_specs(self.cfg.get("exclude_priors", []))
         self.prior_names = [s["name"] for s in self.prior_specs]
-
-        self.case_prior_mask_dict = self._build_case_prior_mask_dict(
-            self.cfg.get("reference_csv", None)
-        )
 
         self.PH = {
             '0': crip_wrapper,
@@ -123,53 +114,6 @@ class AnatomicalPriorLoss(nn.Module):
         exclude_priors = set(exclude_priors or [])
         specs = [s for s in specs if s["name"] not in exclude_priors]
         return specs
-    
-    def _build_case_prior_mask_dict(self, csv_path):
-        if csv_path is None:
-            return {}
-
-        df = pd.read_csv(csv_path)
-
-  
-        if df["strict_pass"].dtype != int and df["strict_pass"].dtype != float:
-            df["strict_pass"] = (
-                df["strict_pass"].astype(str).str.lower().map({
-                    "true": 1,
-                    "false": 0
-                }).fillna(0).astype(int)
-            )
-
-        df = df[df["assumption"].isin(self.prior_names)].copy()
-
-        table = df.pivot_table(
-            index="case",
-            columns="assumption",
-            values="strict_pass",
-            aggfunc="first",
-            fill_value=0
-        )
-
-        table = table.reindex(columns=self.prior_names, fill_value=0)
-
-        mask_dict = {}
-        for case_id, row in table.iterrows():
-            mask_dict[str(case_id)] = torch.tensor(
-                row.values.astype("float32"),
-                dtype=torch.float32
-            )
-
-        return mask_dict
-
-
-    def _get_prior_mask_for_batch(self, case_ids, device):
-        masks = []
-        default_mask = torch.zeros(len(self.prior_names), dtype=torch.float32)
-
-        for k in case_ids:
-            k = str(k)
-            masks.append(self.case_prior_mask_dict.get(k, default_mask))
-
-        return torch.stack(masks, dim=0).to(device)   # [B, P]
 
     def _topo_loss_per_sample_per_prior(self, probs_b: torch.Tensor) -> torch.Tensor:
         device = probs_b.device
@@ -235,22 +179,8 @@ class AnatomicalPriorLoss(nn.Module):
 
         per_prior_loss = torch.stack(per_sample, dim=0)   # [B, P]
 
-        
-        if (case_ids is None) or (len(self.case_prior_mask_dict) == 0):
-            if self.reduction == 'mean':
-                return per_prior_loss.mean()
-            elif self.reduction == 'sum':
-                return per_prior_loss.sum()
-            else:
-                return per_prior_loss
-
-        prior_mask = self._get_prior_mask_for_batch(case_ids, per_prior_loss.device)   # [B, P]
-
-        num = (per_prior_loss * prior_mask).sum(dim=0)              # [P]
-        den = prior_mask.sum(dim=0).clamp_min(1e-8)                 # [P]
-        prior_mean = num / den                                      # [P]
-
-        valid_prior = (prior_mask.sum(dim=0) > 0).float()           # [P]
-        loss = (prior_mean * valid_prior).sum() / valid_prior.sum().clamp_min(1e-8)
-
-        return loss
+        if self.reduction == 'mean':
+            return per_prior_loss.mean()
+        elif self.reduction == 'sum':
+            return per_prior_loss.sum()
+        return per_prior_loss
